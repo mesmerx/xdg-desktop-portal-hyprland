@@ -1,6 +1,8 @@
 #include "wlr_screencast.h"
 
 #include <assert.h>
+#include "linux-dmabuf-unstable-v1-client-protocol.h"
+#include "wlr-screencopy-unstable-v1-client-protocol.h"
 #include <fcntl.h>
 #include <limits.h>
 #include <stdbool.h>
@@ -299,8 +301,9 @@ static void wlr_frame_buffer_done(void *data,
         return;
     }
 
-    zwlr_screencopy_frame_v1_copy_with_damage(frame, cast->current_frame.xdpw_buffer->buffer);
-    logprint(TRACE, "wlroots: frame copied");
+	cast->current_frame.damage_count = 0;
+	zwlr_screencopy_frame_v1_copy_with_damage(frame, cast->current_frame.xdpw_buffer->buffer);
+	logprint(TRACE, "wlroots: frame copied");
 
     fps_limit_measure_start(&cast->fps_limit, cast->framerate);
 }
@@ -325,10 +328,13 @@ static void wlr_frame_damage(void *data, struct zwlr_screencopy_frame_v1 *frame,
 
     logprint(TRACE, "wlroots: damage event handler");
 
-    cast->current_frame.damage.x = x;
-    cast->current_frame.damage.y = y;
-    cast->current_frame.damage.width = width;
-    cast->current_frame.damage.height = height;
+	logprint(TRACE, "wlroots: damage %"PRIu32": %"PRIu32",%"PRIu32"x%"PRIu32",%"PRIu32, cast->current_frame.damage_count, x, y, width, height);
+	struct xdpw_frame_damage damage = {x, y, width, height};
+	if (cast->current_frame.damage_count < 4) {
+		cast->current_frame.damage[cast->current_frame.damage_count++] = damage;
+	} else {
+		cast->current_frame.damage[3] = merge_damage(&cast->current_frame.damage[3], &damage);
+	}
 }
 
 static void wlr_frame_ready(void *data, struct zwlr_screencopy_frame_v1 *frame,
@@ -373,8 +379,9 @@ static const struct zwlr_screencopy_frame_v1_listener wlr_frame_listener = {
     .damage = wlr_frame_damage,
 };
 
-static void hyprland_frame_buffer_done(void *data,
-                                       struct hyprland_toplevel_export_frame_v1 *frame);
+void xdpw_wlr_register_cb(struct xdpw_screencast_instance *cast) {
+	cast->frame_callback = zwlr_screencopy_manager_v1_capture_output(
+		cast->ctx->screencopy_manager, cast->with_cursor, cast->target.output->output);
 
 static void hyprland_frame_buffer(void *data, struct hyprland_toplevel_export_frame_v1 *frame,
                                   uint32_t format, uint32_t width, uint32_t height, uint32_t stride) {
@@ -567,11 +574,12 @@ void xdpw_wlr_register_cb(struct xdpw_screencast_instance *cast) {
 }
 
 static void wlr_output_handle_geometry(void *data, struct wl_output *wl_output,
-                                       int32_t x, int32_t y, int32_t phys_width, int32_t phys_height,
-                                       int32_t subpixel, const char *make, const char *model, int32_t transform) {
-    struct xdpw_wlr_output *output = data;
-    output->make = strdup(make);
-    output->model = strdup(model);
+		int32_t x, int32_t y, int32_t phys_width, int32_t phys_height,
+		int32_t subpixel, const char *make, const char *model, int32_t transform) {
+	struct xdpw_wlr_output *output = data;
+	output->make = strdup(make);
+	output->model = strdup(model);
+	output->transformation = transform;
 }
 
 static void wlr_output_handle_mode(void *data, struct wl_output *wl_output,
@@ -591,55 +599,54 @@ static void wlr_output_handle_scale(void *data, struct wl_output *wl_output,
     /* Nothing to do */
 }
 
+static void wlr_output_handle_name(void *data, struct wl_output *wl_output,
+		const char *name) {
+	struct xdpw_wlr_output *output = data;
+	output->name = strdup(name);
+}
+
+static void wlr_output_handle_description(void *data, struct wl_output *wl_output,
+		const char *description) {
+	/* Nothing to do */
+}
+
 static const struct wl_output_listener wlr_output_listener = {
-    .geometry = wlr_output_handle_geometry,
-    .mode = wlr_output_handle_mode,
-    .done = wlr_output_handle_done,
-    .scale = wlr_output_handle_scale,
+	.geometry = wlr_output_handle_geometry,
+	.mode = wlr_output_handle_mode,
+	.done = wlr_output_handle_done,
+	.scale = wlr_output_handle_scale,
+	.name = wlr_output_handle_name,
+	.description = wlr_output_handle_description,
 };
 
-static void wlr_xdg_output_name(void *data, struct zxdg_output_v1 *xdg_output,
-                                const char *name) {
-    struct xdpw_wlr_output *output = data;
-
-    output->name = strdup(name);
-};
-
-static void noop() {
-    // This space intentionally left blank
+static struct xdpw_wlr_output *xdpw_wlr_output_first(struct wl_list *output_list) {
+	struct xdpw_wlr_output *output, *tmp;
+	wl_list_for_each_safe(output, tmp, output_list, link) {
+		return output;
+	}
+	return NULL;
 }
 
-static const struct zxdg_output_v1_listener wlr_xdg_output_listener = {
-    .logical_position = noop,
-    .logical_size = noop,
-    .done = NULL, /* Deprecated */
-    .description = noop,
-    .name = wlr_xdg_output_name,
-};
-
-static void wlr_add_xdg_output_listener(struct xdpw_wlr_output *output,
-                                        struct zxdg_output_v1 *xdg_output) {
-    output->xdg_output = xdg_output;
-    zxdg_output_v1_add_listener(output->xdg_output, &wlr_xdg_output_listener,
-                                output);
+static struct xdpw_wlr_output *xdpw_wlr_output_find_by_name(struct wl_list *output_list,
+		const char *name) {
+	struct xdpw_wlr_output *output, *tmp;
+	wl_list_for_each_safe(output, tmp, output_list, link) {
+		if (strcmp(output->name, name) == 0) {
+			return output;
+		}
+	}
+	return NULL;
 }
 
-static void wlr_init_xdg_output(struct xdpw_screencast_context *ctx,
-                                struct xdpw_wlr_output *output) {
-    struct zxdg_output_v1 *xdg_output =
-        zxdg_output_manager_v1_get_xdg_output(ctx->xdg_output_manager,
-                                              output->output);
-    wlr_add_xdg_output_listener(output, xdg_output);
-}
-
-static void wlr_init_xdg_outputs(struct xdpw_screencast_context *ctx) {
-    struct xdpw_wlr_output *output, *tmp;
-    wl_list_for_each_safe(output, tmp, &ctx->output_list, link) {
-        if (output->xdg_output) {
-            continue;
-        }
-        wlr_init_xdg_output(ctx, output);
-    }
+static struct xdpw_wlr_output *xdpw_wlr_output_find(struct xdpw_screencast_context *ctx,
+		struct wl_output *out, uint32_t id) {
+	struct xdpw_wlr_output *output, *tmp;
+	wl_list_for_each_safe(output, tmp, &ctx->output_list, link) {
+		if ((output->output == out) || (output->id == id)) {
+			return output;
+		}
+	}
+	return NULL;
 }
 
 // stolen from LLVM cuz it wouldnt include lol
@@ -897,6 +904,10 @@ static void linux_dmabuf_handle_modifier(void *data,
     wlr_format_modifier_pair_add(ctx, format, modifier);
 }
 
+static void noop() {
+       // This space intentionally left blank
+}
+
 static const struct zwp_linux_dmabuf_v1_listener linux_dmabuf_listener = {
     .format = noop,
     .modifier = linux_dmabuf_handle_modifier,
@@ -1043,12 +1054,9 @@ static void wlr_registry_handle_add(void *data, struct wl_registry *reg,
         logprint(DEBUG, "wlroots: |-- registered to interface %s (Version %u)", interface, WL_OUTPUT_VERSION);
         output->output = wl_registry_bind(reg, id, &wl_output_interface, WL_OUTPUT_VERSION);
 
-        wl_output_add_listener(output->output, &wlr_output_listener, output);
-        wl_list_insert(&ctx->output_list, &output->link);
-        if (ctx->xdg_output_manager) {
-            wlr_init_xdg_output(ctx, output);
-        }
-    }
+		wl_output_add_listener(output->output, &wlr_output_listener, output);
+		wl_list_insert(&ctx->output_list, &output->link);
+	}
 
     if (!strcmp(interface, zwlr_screencopy_manager_v1_interface.name)) {
         uint32_t version = ver;
@@ -1066,6 +1074,17 @@ static void wlr_registry_handle_add(void *data, struct wl_registry *reg,
         uint32_t version = ver;
 
         logprint(DEBUG, "hyprland: |-- registered to interface %s (Version %u)", interface, version);
+
+	if (strcmp(interface, zwp_linux_dmabuf_v1_interface.name) == 0) {
+		uint32_t version = ver;
+		if (LINUX_DMABUF_VERSION < ver) {
+			version = LINUX_DMABUF_VERSION;
+		} else if (LINUX_DMABUF_VERSION_MIN > ver) {
+			logprint(INFO, "wlroots: interface %s (Version %u) is required for DMA-BUF screencast", interface, LINUX_DMABUF_VERSION_MIN);
+			return;
+		}
+		logprint(DEBUG, "wlroots: |-- registered to interface %s (Version %u)", interface, version);
+		ctx->linux_dmabuf = wl_registry_bind(reg, id, &zwp_linux_dmabuf_v1_interface, version);
 
         ctx->hyprland_toplevel_manager = wl_registry_bind(reg, id, &hyprland_toplevel_export_manager_v1_interface, version);
     }
@@ -1112,29 +1131,29 @@ static void wlr_registry_handle_add(void *data, struct wl_registry *reg,
 }
 
 static void wlr_registry_handle_remove(void *data, struct wl_registry *reg,
-                                       uint32_t id) {
-    struct xdpw_screencast_context *ctx = data;
-    struct xdpw_wlr_output *output = xdpw_wlr_output_find(ctx, NULL, id);
-    if (output) {
-        logprint(DEBUG, "wlroots: output removed (%s)", output->name);
-        struct xdpw_screencast_instance *cast, *tmp;
-        wl_list_for_each_safe(cast, tmp, &ctx->screencast_instances, link) {
-            if (cast->target.output == output) {
-                // screencopy might be in process for this instance
-                wlr_frame_free(cast);
-                // instance might be waiting for wakeup by the frame limiter
-                struct xdpw_timer *timer, *ttmp;
-                wl_list_for_each_safe(timer, ttmp, &cast->ctx->state->timers, link) {
-                    if (timer->user_data == cast) {
-                        xdpw_destroy_timer(timer);
-                    }
-                }
-                cast->teardown = true;
-                xdpw_screencast_instance_teardown(cast);
-            }
-        }
-        wlr_remove_output(output);
-    }
+		uint32_t id) {
+	struct xdpw_screencast_context *ctx = data;
+	struct xdpw_wlr_output *output = xdpw_wlr_output_find(ctx, NULL, id);
+	if (output) {
+		logprint(DEBUG, "wlroots: output removed (%s)", output->name);
+		struct xdpw_screencast_instance *cast, *tmp;
+		wl_list_for_each_safe(cast, tmp, &ctx->screencast_instances, link) {
+			if (cast->target->output == output) {
+				// screencopy might be in process for this instance
+				wlr_frame_free(cast);
+				// instance might be waiting for wakeup by the frame limiter
+				struct xdpw_timer *timer, *ttmp;
+				wl_list_for_each_safe(timer, ttmp, &cast->ctx->state->timers, link) {
+					if (timer->user_data == cast) {
+						xdpw_destroy_timer(timer);
+					}
+				}
+				cast->teardown = true;
+				xdpw_screencast_instance_teardown(cast);
+			}
+		}
+		wlr_remove_output(output);
+	}
 }
 
 static const struct wl_registry_listener wlr_registry_listener = {
@@ -1162,24 +1181,17 @@ int xdpw_wlr_screencopy_init(struct xdpw_state *state) {
 
     logprint(DEBUG, "wayland: registry listeners run");
 
-    // make sure our wlroots supports xdg_output_manager
-    if (!ctx->xdg_output_manager) {
-        logprint(ERROR, "Compositor doesn't support %s!",
-                 zxdg_output_manager_v1_interface.name);
-        return -1;
-    }
+	if (ctx->linux_dmabuf_feedback) {
+		wl_display_roundtrip(state->wl_display);
 
-    wlr_init_xdg_outputs(ctx);
+		logprint(DEBUG, "wayland: dmabuf_feedback listeners run");
+	}
 
-    wl_display_roundtrip(state->wl_display);
-
-    logprint(DEBUG, "wayland: xdg output listeners run");
-
-    // make sure our wlroots supports shm protocol
-    if (!ctx->shm) {
-        logprint(ERROR, "Compositor doesn't support %s!", "wl_shm");
-        return -1;
-    }
+	// make sure our wlroots supports shm protocol
+	if (!ctx->shm) {
+		logprint(ERROR, "Compositor doesn't support %s!", "wl_shm");
+		return -1;
+	}
 
     // make sure our wlroots supports screencopy protocol
     if (!ctx->screencopy_manager) {
@@ -1202,39 +1214,35 @@ int xdpw_wlr_screencopy_init(struct xdpw_state *state) {
 void xdpw_wlr_screencopy_finish(struct xdpw_screencast_context *ctx) {
     wl_array_release(&ctx->format_modifier_pairs);
 
-    struct xdpw_wlr_output *output, *tmp_o;
-    wl_list_for_each_safe(output, tmp_o, &ctx->output_list, link) {
-        wl_list_remove(&output->link);
-        zxdg_output_v1_destroy(output->xdg_output);
-        wl_output_destroy(output->output);
-    }
+	struct xdpw_wlr_output *output, *tmp_o;
+	wl_list_for_each_safe(output, tmp_o, &ctx->output_list, link) {
+		wl_list_remove(&output->link);
+		wl_output_destroy(output->output);
+	}
 
     struct xdpw_screencast_instance *cast, *tmp_c;
     wl_list_for_each_safe(cast, tmp_c, &ctx->screencast_instances, link) {
         cast->quit = true;
     }
 
-    if (ctx->screencopy_manager) {
-        zwlr_screencopy_manager_v1_destroy(ctx->screencopy_manager);
-    }
-    if (ctx->shm) {
-        wl_shm_destroy(ctx->shm);
-    }
-    if (ctx->xdg_output_manager) {
-        zxdg_output_manager_v1_destroy(ctx->xdg_output_manager);
-    }
-    if (ctx->gbm) {
-        int fd = gbm_device_get_fd(ctx->gbm);
-        gbm_device_destroy(ctx->gbm);
-        close(fd);
-    }
-    if (ctx->linux_dmabuf_feedback) {
-        zwp_linux_dmabuf_feedback_v1_destroy(ctx->linux_dmabuf_feedback);
-    }
-    if (ctx->linux_dmabuf) {
-        zwp_linux_dmabuf_v1_destroy(ctx->linux_dmabuf);
-    }
-    if (ctx->registry) {
-        wl_registry_destroy(ctx->registry);
-    }
+	if (ctx->screencopy_manager) {
+		zwlr_screencopy_manager_v1_destroy(ctx->screencopy_manager);
+	}
+	if (ctx->shm) {
+		wl_shm_destroy(ctx->shm);
+	}
+	if (ctx->gbm) {
+		int fd = gbm_device_get_fd(ctx->gbm);
+		gbm_device_destroy(ctx->gbm);
+		close(fd);
+	}
+	if (ctx->linux_dmabuf_feedback) {
+		zwp_linux_dmabuf_feedback_v1_destroy(ctx->linux_dmabuf_feedback);
+	}
+	if (ctx->linux_dmabuf) {
+		zwp_linux_dmabuf_v1_destroy(ctx->linux_dmabuf);
+	}
+	if (ctx->registry) {
+		wl_registry_destroy(ctx->registry);
+	}
 }
