@@ -319,9 +319,6 @@ static int method_screencast_select_sources(sd_bus_message *msg, void *data,
 
     logprint(INFO, "dbus: select sources method invoked");
 
-    // default to embedded cursor mode if not specified
-    bool cursor_embedded = true;
-
     char *request_handle, *session_handle, *app_id;
     ret = sd_bus_message_read(msg, "oos", &request_handle, &session_handle, &app_id);
     if (ret < 0) {
